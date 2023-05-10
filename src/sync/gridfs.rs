@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub use crate::gridfs::FilesCollectionDocument;
+use crate::gridfs::GridFsDownloadByIdOptions;
 
 /// A `GridFsBucket` provides the functionality for storing and retrieving binary BSON data that
 /// exceeds the 16 MiB size limit of a MongoDB document. Users may upload and download large amounts
@@ -62,7 +63,7 @@ impl GridFsBucket {
 /// use std::io::Read;
 ///
 /// let mut buf = Vec::new();
-/// let mut download_stream = bucket.open_download_stream(id).run()?;
+/// let mut download_stream = bucket.open_download_stream(id, None)?;
 /// download_stream.read_to_end(&mut buf)?;
 /// # Ok(())
 /// # }
@@ -83,6 +84,39 @@ impl Read for GridFsDownloadStream {
 impl GridFsDownloadStream {
     pub(crate) fn new(async_stream: AsyncGridFsDownloadStream) -> Self {
         Self { async_stream }
+    }
+}
+
+// Download API
+impl GridFsBucket {
+    /// Opens and returns a [`GridFsDownloadStream`] from which the application can read
+    /// the contents of the stored file specified by `id`.
+    pub fn open_download_stream(
+        &self,
+        id: Bson,
+        options: impl Into<Option<GridFsDownloadByIdOptions>>,
+    ) -> Result<GridFsDownloadStream> {
+        runtime::block_on(self.async_bucket.open_download_stream(id, options))
+            .map(GridFsDownloadStream::new)
+    }
+
+    /// Opens and returns a [`GridFsDownloadStream`] from which the application can read
+    /// the contents of the stored file specified by `filename`.
+    ///
+    /// If there are multiple files in the bucket with the given filename, the `revision` in the
+    /// options provided is used to determine which one to download. See the documentation for
+    /// [`GridFsDownloadByNameOptions`] for details on how to specify a revision. If no revision is
+    /// provided, the file with `filename` most recently uploaded will be downloaded.
+    pub fn open_download_stream_by_name(
+        &self,
+        filename: impl AsRef<str>,
+        options: impl Into<Option<GridFsDownloadByNameOptions>>,
+    ) -> Result<GridFsDownloadStream> {
+        runtime::block_on(
+            self.async_bucket
+                .open_download_stream_by_name(filename, options),
+        )
+        .map(GridFsDownloadStream::new)
     }
 }
 
