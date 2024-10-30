@@ -14,7 +14,7 @@ mod drop;
 mod drop_index;
 mod find;
 mod find_and_modify;
-pub mod gridfs;
+pub(crate) mod gridfs;
 mod insert_many;
 mod insert_one;
 mod list_collections;

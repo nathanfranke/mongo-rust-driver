@@ -6,10 +6,30 @@ use crate::{
     gridfs::{
         FilesCollectionDocument,
         GridFsBucket,
+        GridFsDownloadByIdOptions,
         GridFsDownloadByNameOptions,
         GridFsDownloadStream,
     },
 };
+
+// TODO: Determine proper visibility, including parent modules.
+pub struct DownloadRange(pub Option<u64>, pub Option<u64>);
+
+fn create_download_range(start: Option<u64>, end: Option<u64>) -> Result<DownloadRange> {
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            if start <= end {
+                Ok(DownloadRange(Some(start), Some(end)))
+            } else {
+                Err(
+                    ErrorKind::GridFs(GridFsErrorKind::InvalidPartialDownloadRange { start, end })
+                        .into(),
+                )
+            }
+        }
+        _ => Ok(DownloadRange(start, end)),
+    }
+}
 
 impl GridFsBucket {
     /// Opens and returns a [`GridFsDownloadStream`] from which the application can read
@@ -18,7 +38,11 @@ impl GridFsBucket {
     /// `await` will return d[`Result<GridFsDownloadStream>`].
     #[deeplink]
     pub fn open_download_stream(&self, id: Bson) -> OpenDownloadStream {
-        OpenDownloadStream { bucket: self, id }
+        OpenDownloadStream {
+            bucket: self,
+            id,
+            options: None,
+        }
     }
 
     /// Opens and returns a [`GridFsDownloadStream`] from which the application can read
@@ -129,6 +153,14 @@ impl crate::sync::gridfs::GridFsBucket {
 pub struct OpenDownloadStream<'a> {
     bucket: &'a GridFsBucket,
     id: Bson,
+    options: Option<GridFsDownloadByIdOptions>,
+}
+
+impl<'a> OpenDownloadStream<'a> {
+    option_setters! { options: GridFsDownloadByIdOptions;
+        start: u64,
+        end: u64,
+    }
 }
 
 #[action_impl(sync = crate::sync::gridfs::GridFsDownloadStream)]
@@ -136,8 +168,13 @@ impl<'a> Action for OpenDownloadStream<'a> {
     type Future = OpenDownloadStreamFuture;
 
     async fn execute(self) -> Result<GridFsDownloadStream> {
+        let range = create_download_range(
+            self.options.as_ref().and_then(|options| options.start),
+            self.options.as_ref().and_then(|options| options.end),
+        )?;
+
         let file = self.bucket.find_file_by_id(&self.id).await?;
-        GridFsDownloadStream::new(file, self.bucket.chunks()).await
+        GridFsDownloadStream::new(file, self.bucket.chunks(), range).await
     }
 }
 
@@ -154,6 +191,8 @@ pub struct OpenDownloadStreamByName<'a> {
 impl<'a> OpenDownloadStreamByName<'a> {
     option_setters! { options: GridFsDownloadByNameOptions;
         revision: i32,
+        start: u64,
+        end: u64,
     }
 }
 
@@ -162,10 +201,15 @@ impl<'a> Action for OpenDownloadStreamByName<'a> {
     type Future = OpenDownloadStreamByNameFuture;
 
     async fn execute(self) -> Result<GridFsDownloadStream> {
+        let range = create_download_range(
+            self.options.as_ref().and_then(|options| options.start),
+            self.options.as_ref().and_then(|options| options.end),
+        )?;
+
         let file = self
             .bucket
             .find_file_by_name(&self.filename, self.options)
             .await?;
-        GridFsDownloadStream::new(file, self.bucket.chunks()).await
+        GridFsDownloadStream::new(file, self.bucket.chunks(), range).await
     }
 }

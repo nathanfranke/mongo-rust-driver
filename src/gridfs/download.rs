@@ -11,197 +11,13 @@ use futures_util::{
 
 use super::{Chunk, FilesCollectionDocument};
 use crate::{
-    bson::{doc, Bson},
-    error::{ErrorKind, GridFsErrorKind, GridFsFileIdentifier, Result},
-    gridfs::GridFsDownloadByIdOptions,
-    options::{FindOneOptions, FindOptions},
+    action::gridfs::download::DownloadRange,
+    bson::doc,
+    error::{ErrorKind, GridFsErrorKind, Result},
+    options::FindOptions,
     Collection,
     Cursor,
 };
-
-struct DownloadRange(Option<u64>, Option<u64>);
-
-// Utility functions for finding files within the bucket.
-impl GridFsBucket {
-    async fn find_file_by_id(&self, id: &Bson) -> Result<FilesCollectionDocument> {
-        match self.files().find_one(doc! { "_id": id }, None).await? {
-            Some(file) => Ok(file),
-            None => Err(ErrorKind::GridFs(GridFsErrorKind::FileNotFound {
-                identifier: GridFsFileIdentifier::Id(id.clone()),
-            })
-            .into()),
-        }
-    }
-
-    async fn find_file_by_name(
-        &self,
-        filename: &str,
-        options: Option<GridFsDownloadByNameOptions>,
-    ) -> Result<FilesCollectionDocument> {
-        let revision = options.and_then(|opts| opts.revision).unwrap_or(-1);
-        let (sort, skip) = if revision >= 0 {
-            (1, revision)
-        } else {
-            (-1, -revision - 1)
-        };
-        let options = FindOneOptions::builder()
-            .sort(doc! { "uploadDate": sort })
-            .skip(skip as u64)
-            .build();
-
-        match self
-            .files()
-            .find_one(doc! { "filename": filename }, options)
-            .await?
-        {
-            Some(fcd) => Ok(fcd),
-            None => {
-                if self
-                    .files()
-                    .find_one(doc! { "filename": filename }, None)
-                    .await?
-                    .is_some()
-                {
-                    Err(ErrorKind::GridFs(GridFsErrorKind::RevisionNotFound { revision }).into())
-                } else {
-                    Err(ErrorKind::GridFs(GridFsErrorKind::FileNotFound {
-                        identifier: GridFsFileIdentifier::Filename(filename.into()),
-                    })
-                    .into())
-                }
-            }
-        }
-    }
-}
-
-// User functions for downloading to writers.
-impl GridFsBucket {
-    /// Downloads the contents of the stored file specified by `id` and writes the contents to the
-    /// `destination`, which may be any type that implements the [`futures_io::AsyncWrite`] trait.
-    ///
-    /// To download to a type that implements [`tokio::io::AsyncWrite`], use the
-    /// [`tokio_util::compat`] module to convert between types.
-    ///
-    /// ```rust
-    /// # use mongodb::{bson::Bson, error::Result, gridfs::GridFsBucket};
-    /// # async fn compat_example(
-    /// #     bucket: GridFsBucket,
-    /// #     tokio_writer: impl tokio::io::AsyncWrite + Unpin,
-    /// #     id: Bson,
-    /// # ) -> Result<()> {
-    /// use tokio_util::compat::TokioAsyncWriteCompatExt;
-    ///
-    /// let futures_writer = tokio_writer.compat_write();
-    /// bucket.download_to_futures_0_3_writer(id, futures_writer).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// Note that once an `AsyncWrite` trait is stabilized in the standard library, this method will
-    /// be deprecated in favor of one that accepts a `std::io::AsyncWrite` source.
-    pub async fn download_to_futures_0_3_writer<T>(&self, id: Bson, destination: T) -> Result<()>
-    where
-        T: AsyncWrite + Unpin,
-    {
-        let file = self.find_file_by_id(&id).await?;
-        self.download_to_writer_common(file, destination).await
-    }
-
-    /// Downloads the contents of the stored file specified by `filename` and writes the contents to
-    /// the `destination`, which may be any type that implements the [`futures_io::AsyncWrite`]
-    /// trait.
-    ///
-    /// If there are multiple files in the bucket with the given filename, the `revision` in the
-    /// options provided is used to determine which one to download. See the documentation for
-    /// [`GridFsDownloadByNameOptions`] for details on how to specify a revision. If no revision is
-    /// provided, the file with `filename` most recently uploaded will be downloaded.
-    ///
-    /// To download to a type that implements [`tokio::io::AsyncWrite`], use the
-    /// [`tokio_util::compat`] module to convert between types.
-    ///
-    /// ```rust
-    /// # use mongodb::{bson::Bson, error::Result, gridfs::GridFsBucket};
-    /// # async fn compat_example(
-    /// #     bucket: GridFsBucket,
-    /// #     tokio_writer: impl tokio::io::AsyncWrite + Unpin,
-    /// #     id: Bson,
-    /// # ) -> Result<()> {
-    /// use tokio_util::compat::TokioAsyncWriteCompatExt;
-    ///
-    /// let futures_writer = tokio_writer.compat_write();
-    /// bucket.download_to_futures_0_3_writer_by_name("example_file", futures_writer, None).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// Note that once an `AsyncWrite` trait is stabilized in the standard library, this method will
-    /// be deprecated in favor of one that accepts a `std::io::AsyncWrite` source.
-    pub async fn download_to_futures_0_3_writer_by_name<T>(
-        &self,
-        filename: impl AsRef<str>,
-        destination: T,
-        options: impl Into<Option<GridFsDownloadByNameOptions>>,
-    ) -> Result<()>
-    where
-        T: AsyncWrite + Unpin,
-    {
-        let file = self
-            .find_file_by_name(filename.as_ref(), options.into())
-            .await?;
-        self.download_to_writer_common(file, destination).await
-    }
-
-    async fn download_to_writer_common<T>(
-        &self,
-        file: FilesCollectionDocument,
-        mut destination: T,
-    ) -> Result<()>
-    where
-        T: AsyncWrite + Unpin,
-    {
-        if file.length == 0 {
-            return Ok(());
-        }
-
-        let options = FindOptions::builder().sort(doc! { "n": 1 }).build();
-        let mut cursor = self
-            .chunks()
-            .find(doc! { "files_id": &file.id }, options)
-            .await?;
-
-        let mut n = 0;
-        while cursor.advance().await? {
-            let chunk = cursor.deserialize_current()?;
-            if chunk.n != n {
-                return Err(ErrorKind::GridFs(GridFsErrorKind::MissingChunk { n }).into());
-            }
-
-            let chunk_length = chunk.data.bytes.len();
-            let expected_length = file.expected_chunk_length(n);
-            if chunk_length != expected_length as usize {
-                return Err(ErrorKind::GridFs(GridFsErrorKind::WrongSizeChunk {
-                    actual_size: chunk_length,
-                    expected_size: expected_length,
-                    n,
-                })
-                .into());
-            }
-
-            destination.write_all(chunk.data.bytes).await?;
-            n += 1;
-        }
-
-        if n != file.n() {
-            return Err(ErrorKind::GridFs(GridFsErrorKind::WrongNumberOfChunks {
-                actual_number: n,
-                expected_number: file.n(),
-            })
-            .into());
-        }
-
-        Ok(())
-    }
-}
 
 /// A stream from which a file stored in a GridFS bucket can be downloaded.
 ///
@@ -216,7 +32,7 @@ impl GridFsBucket {
 /// use futures_util::io::AsyncReadExt;
 ///
 /// let mut buf = Vec::new();
-/// let mut download_stream = bucket.open_download_stream(id, None).await?;
+/// let mut download_stream = bucket.open_download_stream(id).await?;
 /// download_stream.read_to_end(&mut buf).await?;
 /// # Ok(())
 /// # }
@@ -233,7 +49,7 @@ impl GridFsBucket {
 /// # async fn compat_example(bucket: GridFsBucket, id: Bson) -> Result<()> {
 /// use tokio_util::compat::FuturesAsyncReadCompatExt;
 ///
-/// let futures_upload_stream = bucket.open_download_stream(id, None).await?;
+/// let futures_upload_stream = bucket.open_download_stream(id).await?;
 /// let tokio_upload_stream = futures_upload_stream.compat();
 /// # Ok(())
 /// # }
@@ -318,10 +134,8 @@ impl GridFsDownloadStream {
                 .limit(total_chunks.map(|end| (end - chunks_to_skip) as i64))
                 .build();
             let cursor = chunks
-                .find(
-                    doc! { "files_id": &file.id, "n": { "$gte": chunks_to_skip as i64 } },
-                    options,
-                )
+                .find(doc! { "files_id": &file.id, "n": { "$gte": chunks_to_skip as i64 } })
+                .with_options(options)
                 .await?;
 
             State::Idle(Some(Idle {
@@ -464,65 +278,4 @@ async fn get_bytes(
     }
 
     Ok((buffer, cursor))
-}
-
-fn create_download_range(start: Option<u64>, end: Option<u64>) -> Result<DownloadRange> {
-    match (start, end) {
-        (Some(start), Some(end)) => {
-            if start <= end {
-                Ok(DownloadRange(Some(start), Some(end)))
-            } else {
-                Err(
-                    ErrorKind::GridFs(GridFsErrorKind::InvalidPartialDownloadRange { start, end })
-                        .into(),
-                )
-            }
-        }
-        _ => Ok(DownloadRange(start, end)),
-    }
-}
-
-// User functions for creating download streams.
-impl GridFsBucket {
-    /// Opens and returns a [`GridFsDownloadStream`] from which the application can read
-    /// the contents of the stored file specified by `id`.
-    pub async fn open_download_stream(
-        &self,
-        id: Bson,
-        options: impl Into<Option<GridFsDownloadByIdOptions>>,
-    ) -> Result<GridFsDownloadStream> {
-        let options: Option<GridFsDownloadByIdOptions> = options.into();
-        let file = self.find_file_by_id(&id).await?;
-
-        let range = create_download_range(
-            options.as_ref().and_then(|options| options.start),
-            options.as_ref().and_then(|options| options.end),
-        )?;
-
-        GridFsDownloadStream::new(file, self.chunks(), range).await
-    }
-
-    /// Opens and returns a [`GridFsDownloadStream`] from which the application can read
-    /// the contents of the stored file specified by `filename`.
-    ///
-    /// If there are multiple files in the bucket with the given filename, the `revision` in the
-    /// options provided is used to determine which one to download. See the documentation for
-    /// [`GridFsDownloadByNameOptions`] for details on how to specify a revision. If no revision is
-    /// provided, the file with `filename` most recently uploaded will be downloaded.
-    pub async fn open_download_stream_by_name(
-        &self,
-        filename: impl AsRef<str>,
-        options: impl Into<Option<GridFsDownloadByNameOptions>>,
-    ) -> Result<GridFsDownloadStream> {
-        let options: Option<GridFsDownloadByNameOptions> = options.into();
-
-        let range = create_download_range(
-            options.as_ref().and_then(|options| options.start),
-            options.as_ref().and_then(|options| options.end),
-        )?;
-
-        let file = self.find_file_by_name(filename.as_ref(), options).await?;
-
-        GridFsDownloadStream::new(file, self.chunks(), range).await
-    }
 }

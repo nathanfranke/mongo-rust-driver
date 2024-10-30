@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::{
-    bson::{doc, oid::ObjectId, Bson, DateTime, Document, RawBinaryRef},
+    bson::{oid::ObjectId, Bson, DateTime, Document, RawBinaryRef},
     checked::Checked,
     error::Error,
     options::{CollectionOptions, ReadConcern, SelectionCriteria, WriteConcern},

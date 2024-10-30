@@ -1,7 +1,7 @@
 //! Action builders for gridfs.
 
 mod delete;
-mod download;
+pub mod download;
 mod drop;
 mod find;
 mod rename;
